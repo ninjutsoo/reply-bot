@@ -48,7 +48,7 @@ DRAFTS_FILE = DATA_DIR / "drafts.json"
 pending_users: set[int] = set()
 threads: list[dict] = []
 # Store draft messages with their states
-# Format: {user_id: {"message": "text", "message_id": int, "target_user_id": int, "is_editing": bool}}
+# Format: {user_chat_id: {"text": str, "preview_message_id": int, "is_editing": bool}}
 draft_messages: dict[int, dict] = {}
 
 
@@ -65,28 +65,44 @@ def load_threads() -> None:
 def load_drafts() -> None:
     global draft_messages
     try:
-        draft_messages = json.loads(DRAFTS_FILE.read_text(encoding="utf-8"))
-        if not isinstance(draft_messages, dict):
+        raw = json.loads(DRAFTS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
             draft_messages = {}
+            return
+        # JSON object keys are strings; convert to ints where possible
+        fixed: dict[int, dict] = {}
+        for k, v in raw.items():
+            try:
+                ik = int(k)
+            except Exception:
+                continue
+            if isinstance(v, dict):
+                fixed[ik] = v
+        draft_messages = fixed
     except Exception:
         draft_messages = {}
 
 
 def save_draft(user_id: int, draft_data: dict) -> None:
-    draft_messages[user_id] = draft_data
+    uid = int(user_id)
+    draft_messages[uid] = draft_data
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        DRAFTS_FILE.write_text(json.dumps(draft_messages), encoding="utf-8")
+        # Ensure keys persist as strings for JSON
+        to_save = {str(k): v for k, v in draft_messages.items()}
+        DRAFTS_FILE.write_text(json.dumps(to_save), encoding="utf-8")
     except Exception as e:
         print("Failed to save draft:", e)
 
 
 def remove_draft(user_id: int) -> None:
-    if user_id in draft_messages:
-        del draft_messages[user_id]
+    uid = int(user_id)
+    if uid in draft_messages:
+        del draft_messages[uid]
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            DRAFTS_FILE.write_text(json.dumps(draft_messages), encoding="utf-8")
+            to_save = {str(k): v for k, v in draft_messages.items()}
+            DRAFTS_FILE.write_text(json.dumps(to_save), encoding="utf-8")
         except Exception as e:
             print("Failed to remove draft:", e)
 
@@ -115,11 +131,105 @@ def create_send_edit_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Create inline keyboard with Send and Edit buttons."""
     keyboard = [
         [
-            InlineKeyboardButton("✅ Send", callback_data=f"send_{user_id}"),
-            InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{user_id}")
+            InlineKeyboardButton("Send", callback_data=f"send_{user_id}"),
+            InlineKeyboardButton("Edit", callback_data=f"edit_{user_id}")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def format_user_line(user_chat_id: int, full_name: str, username: str | None, text: str) -> str:
+    handle = f" (@{username})" if username else ""
+    return f"{full_name}{handle}\n\n{text}"
+
+
+async def _delete_message_later(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    delay_seconds: int,
+) -> None:
+    async def _job_cb(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        data = ctx.job.data or {}
+        try:
+            await ctx.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+        except Exception:
+            return
+
+    try:
+        context.job_queue.run_once(
+            _job_cb,
+            delay_seconds,
+            data={"chat_id": chat_id, "message_id": message_id},
+            name=f"del:{chat_id}:{message_id}",
+        )
+    except Exception:
+        return
+
+
+async def _send_ephemeral(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    delay_seconds: int = 8,
+) -> None:
+    try:
+        m = await context.bot.send_message(chat_id=chat_id, text=text)
+        await _delete_message_later(context, chat_id, m.message_id, delay_seconds)
+    except Exception:
+        return
+
+
+async def _update_user_preview(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_chat_id: int,
+    preview_message_id: int,
+    text: str,
+) -> None:
+    keyboard = create_send_edit_keyboard(user_chat_id)
+    await context.bot.edit_message_text(
+        chat_id=user_chat_id,
+        message_id=preview_message_id,
+        text=text,
+        reply_markup=keyboard,
+    )
+
+
+async def on_edited_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    When the user edits their message using Telegram's native Edit UI,
+    automatically update the bot's draft preview (and keep Send/Edit buttons).
+    """
+    msg = update.edited_message
+    if not msg or not msg.text:
+        return
+    if msg.chat.type != "private":
+        return
+
+    user_chat_id = msg.chat_id
+    draft = draft_messages.get(user_chat_id)
+    if not draft:
+        return
+
+    origin_id = draft.get("origin_message_id")
+    if origin_id != msg.message_id:
+        return
+
+    # Update draft + preview
+    from_user = msg.from_user
+    full_name = " ".join(filter(None, [from_user.first_name, from_user.last_name])) or "Unknown" if from_user else "Unknown"
+    username = from_user.username if from_user else None
+
+    draft["text"] = msg.text
+    draft["user_line"] = format_user_line(user_chat_id, full_name, username, msg.text)
+    save_draft(user_chat_id, draft)
+
+    preview_message_id = draft.get("preview_message_id")
+    if isinstance(preview_message_id, int):
+        try:
+            await _update_user_preview(context, user_chat_id, preview_message_id, msg.text)
+        except Exception as e:
+            log.exception("Failed to update draft preview after edit: %s", e)
 
 
 async def resolve_user_chat_id(reply_to_message) -> int | None:
@@ -129,22 +239,13 @@ async def resolve_user_chat_id(reply_to_message) -> int | None:
     from_file = find_user_by_group_message(GROUP_ID, mid)
     if from_file is not None:
         return from_file
-    text = getattr(reply_to_message, "text", None) or ""
-    match = re.search(r"User\s*<(-?\d+)>", text)
-    return int(match.group(1)) if match else None
+    # No reliable fallback parsing since we don't include user IDs in the group message text.
+    return None
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg or not msg.text:
-        return
-
-    # Check if this is an edit message first
-    admin_user_id = msg.from_user.id
-    if (msg.reply_to_message and 
-        admin_user_id in draft_messages and 
-        draft_messages[admin_user_id].get("is_editing", False)):
-        await on_edit_message(update, context)
         return
 
     # Reply in group: only in configured group, only to bot's messages
@@ -155,73 +256,68 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         user_chat_id = await resolve_user_chat_id(msg.reply_to_message)
         if user_chat_id is not None:
-            # Send message with Send/Edit buttons to the admin who replied
-            admin_user_id = msg.from_user.id
-            keyboard = create_send_edit_keyboard(user_chat_id)
-            
-            # Store the draft message
-            draft_data = {
-                "message": msg.text,
-                "target_user_id": user_chat_id,
-                "is_editing": False
-            }
-            save_draft(admin_user_id, draft_data)
-            
-            # Send the message with buttons to the admin
-            sent_msg = await context.bot.send_message(
-                chat_id=admin_user_id, 
-                text=f"📝 **Draft Reply:**\n\n{msg.text}\n\n👆 Choose an action:", 
-                reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
-            
-            # Update draft with message_id for editing
-            draft_data["message_id"] = sent_msg.message_id
-            save_draft(admin_user_id, draft_data)
-            
-            log.info("DRAFT_CREATED admin=%s target_user=%s text=%s", admin_user_id, user_chat_id, (msg.text[:50] + "…") if len(msg.text) > 50 else msg.text)
+            # Direct reply to user (old behavior - send immediately)
+            await context.bot.send_message(chat_id=user_chat_id, text=msg.text)
+            pending_users.discard(user_chat_id)
+            log.info("REPLY_BACK to_user=%s text=%s", user_chat_id, (msg.text[:50] + "…") if len(msg.text) > 50 else msg.text)
         return
 
     # Only forward when user messages in private
     if msg.chat.type != "private":
         return
 
+    user_chat_id = msg.chat_id
+
     if msg.from_user.id in pending_users:
-        await msg.reply_text(WAITING_MESSAGE)
+        # Keep chat clean: auto-delete the bot notice.
+        await _send_ephemeral(context, user_chat_id, WAITING_MESSAGE, delay_seconds=8)
         return
 
     from_user = msg.from_user
     full_name = " ".join(filter(None, [from_user.first_name, from_user.last_name])) or "Unknown"
-    handle = f" (@{from_user.username})" if from_user.username else ""
-    user_line = f"User: {full_name}{handle}\n\n{msg.text}"
+    user_line = format_user_line(user_chat_id, full_name, from_user.username, msg.text)
 
-    await context.bot.send_message(chat_id=msg.chat_id, text=MESSAGE_AFTER)
+    # Draft flow: buttons appear in the user's chat with the bot.
+    existing = draft_messages.get(user_chat_id)
+    keyboard = create_send_edit_keyboard(user_chat_id)
+
+    # If user already has a draft preview, update it; otherwise create a new preview message.
+    if existing and isinstance(existing.get("preview_message_id"), int):
+        existing["text"] = msg.text
+        existing["user_line"] = user_line
+        existing["origin_message_id"] = msg.message_id
+        save_draft(user_chat_id, existing)
+        try:
+            await _update_user_preview(context, user_chat_id, existing["preview_message_id"], msg.text)
+        except Exception as e:
+            log.exception("Failed to update draft preview: %s", e)
+        return
 
     try:
-        sent = await context.bot.send_message(chat_id=GROUP_ID, text=user_line)
-        group_message_id = sent.message_id
-        log.info("MESSAGE_SENT user_id=%s name=%s forwarded_to_group group_message_id=%s", msg.chat_id, full_name, group_message_id)
+        preview = await context.bot.send_message(
+            chat_id=user_chat_id,
+            text=msg.text,
+            reply_markup=keyboard,
+            reply_to_message_id=msg.message_id,
+        )
+        save_draft(
+            user_chat_id,
+            {
+                "text": msg.text,
+                "user_line": user_line,
+                "preview_message_id": preview.message_id,
+                "origin_message_id": msg.message_id,
+            },
+        )
+        log.info(
+            "DRAFT_CREATED user_id=%s name=%s",
+            user_chat_id,
+            full_name,
+        )
     except Exception as e:
-        log.exception("Failed to send message to group: %s", e)
-        await context.bot.send_message(
-            msg.chat_id, "Couldn't reach the admins right now. Please try again in a moment."
-        )
+        log.exception("Failed to create draft preview: %s", e)
+        await context.bot.send_message(user_chat_id, "Couldn't create a draft right now. Please try again.")
         return
-
-    if group_message_id is None:
-        log.error("Send to group returned no message id")
-        await context.bot.send_message(
-            msg.chat_id, "Couldn't reach the admins right now. Please try again in a moment."
-        )
-        return
-
-    row = {
-        "group_chat_id": GROUP_ID,
-        "group_message_id": group_message_id,
-        "user_chat_id": msg.chat_id,
-    }
-    save_thread(row)
-    pending_users.add(msg.chat_id)
 
 
 async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -231,98 +327,86 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     if not query.data:
         return
-    
-    admin_user_id = query.from_user.id
-    
-    # Check if admin has a draft
-    if admin_user_id not in draft_messages:
-        await query.edit_message_text("❌ No draft found. Please reply to a user message first.")
+
+    # Buttons must only work in private chat with the user.
+    if not query.message or query.message.chat.type != "private":
         return
-    
-    draft_data = draft_messages[admin_user_id]
-    
-    if query.data.startswith("send_"):
-        # Send the message to the user
-        target_user_id = draft_data["target_user_id"]
-        message_text = draft_data["message"]
-        
-        try:
-            await context.bot.send_message(chat_id=target_user_id, text=message_text)
-            pending_users.discard(target_user_id)
-            
-            # Update the admin's message to show it was sent
-            await query.edit_message_text(
-                f"✅ **Message Sent Successfully!**\n\n{message_text}",
-                parse_mode="Markdown"
-            )
-            
-            # Remove the draft
-            remove_draft(admin_user_id)
-            
-            log.info("MESSAGE_SENT admin=%s to_user=%s text=%s", admin_user_id, target_user_id, (message_text[:50] + "…") if len(message_text) > 50 else message_text)
-            
-        except Exception as e:
-            log.exception("Failed to send message to user: %s", e)
-            await query.edit_message_text(
-                f"❌ **Failed to send message.**\n\nError: {str(e)}\n\nPlease try again.",
-                parse_mode="Markdown"
-            )
-    
-    elif query.data.startswith("edit_"):
-        # Enter edit mode
-        draft_data["is_editing"] = True
-        save_draft(admin_user_id, draft_data)
-        
-        await query.edit_message_text(
-            f"✏️ **Edit Mode**\n\nCurrent message:\n{draft_data['message']}\n\n📝 Send your edited message as a reply to this message.",
-            parse_mode="Markdown"
+
+    if not (query.data.startswith("send_") or query.data.startswith("edit_")):
+        await query.edit_message_text("Invalid button data.")
+        return
+
+    try:
+        user_chat_id = int(query.data.split("_", 1)[1])
+    except Exception:
+        await query.edit_message_text("Invalid button data.")
+        return
+
+    # Ensure only the same user can use their buttons
+    if query.from_user.id != user_chat_id:
+        return
+
+    draft = draft_messages.get(user_chat_id)
+    if not draft:
+        await query.edit_message_text("No draft found. Send a message to create one.")
+        return
+
+    if query.data.startswith("edit_"):
+        # Bots cannot open Telegram's native edit UI. Instead, instruct the user to edit
+        # their last message using Telegram's built-in Edit action; we'll auto-update preview.
+        note = (
+            "To edit using Telegram:\n"
+            "1. Tap and hold your last message\n"
+            "2. Tap Edit\n"
+            "3. Change the text and save\n\n"
+            "The preview above will update automatically."
         )
-
-
-async def on_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle edited messages when user is in edit mode."""
-    msg = update.message
-    if not msg or not msg.text:
-        return
-    
-    admin_user_id = msg.from_user.id
-    
-    # Check if this is a reply to our edit message and user is in edit mode
-    if (msg.reply_to_message and 
-        admin_user_id in draft_messages and 
-        draft_messages[admin_user_id].get("is_editing", False)):
-        
-        # Update the draft with the new message
-        draft_data = draft_messages[admin_user_id]
-        draft_data["message"] = msg.text
-        draft_data["is_editing"] = False
-        save_draft(admin_user_id, draft_data)
-        
-        # Create new keyboard and update the message
-        keyboard = create_send_edit_keyboard(draft_data["target_user_id"])
-        
         try:
-            # Edit the original message with the new content
+            # Edit the preview message itself (no extra clutter).
             await context.bot.edit_message_text(
-                chat_id=admin_user_id,
-                message_id=draft_data["message_id"],
-                text=f"📝 **Updated Draft Reply:**\n\n{msg.text}\n\n👆 Choose an action:",
-                reply_markup=keyboard,
-                parse_mode="Markdown"
+                chat_id=user_chat_id,
+                message_id=query.message.message_id,
+                text=note,
+                reply_markup=create_send_edit_keyboard(user_chat_id),
             )
-            
-            # Delete the user's edit message to keep chat clean
-            await msg.delete()
-            
-            log.info("DRAFT_UPDATED admin=%s new_text=%s", admin_user_id, (msg.text[:50] + "…") if len(msg.text) > 50 else msg.text)
-            
-        except Exception as e:
-            log.exception("Failed to update draft: %s", e)
-            await msg.reply_text("❌ Failed to update draft. Please try again.")
+        except Exception:
+            await _send_ephemeral(context, user_chat_id, note, delay_seconds=12)
+        return
+
+    # Send pressed: forward to group (no buttons in group)
+    try:
+        user_line = draft.get("user_line") or draft.get("text") or ""
+        sent = await context.bot.send_message(chat_id=GROUP_ID, text=user_line)
+        group_message_id = sent.message_id
+
+        row = {"group_chat_id": GROUP_ID, "group_message_id": group_message_id, "user_chat_id": user_chat_id}
+        save_thread(row)
+        pending_users.add(user_chat_id)
+
+        # Keep chat clean: delete the bot preview message. User's original message remains.
+        try:
+            await context.bot.delete_message(chat_id=user_chat_id, message_id=query.message.message_id)
+        except Exception:
+            try:
+                await query.edit_message_text("Sent.")
+                await _delete_message_later(context, user_chat_id, query.message.message_id, delay_seconds=6)
+            except Exception:
+                pass
+        remove_draft(user_chat_id)
+        log.info("MESSAGE_SENT user_id=%s forwarded_to_group group_message_id=%s", user_chat_id, group_message_id)
+    except Exception as e:
+        log.exception("Failed to send message to group: %s", e)
+        try:
+            await query.edit_message_text("Couldn't reach the admins right now. Please try again in a moment.")
+            await _delete_message_later(context, user_chat_id, query.message.message_id, delay_seconds=10)
+        except Exception:
+            pass
+        return
 
 
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(WELCOME_MESSAGE)
+    # Keep chat clean: short welcome, auto-delete.
+    await _send_ephemeral(context, update.message.chat_id, WELCOME_MESSAGE, delay_seconds=10)
 
 
 def main() -> None:
@@ -334,6 +418,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CallbackQueryHandler(on_callback_query))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT & ~filters.COMMAND, on_edited_private_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     if USE_WEBHOOK:
