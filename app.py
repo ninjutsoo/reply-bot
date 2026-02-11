@@ -12,8 +12,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
-from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 load_dotenv()
 
@@ -44,8 +44,12 @@ WAITING_MESSAGE = os.environ.get(
 # Local file store for message threads
 DATA_DIR = Path(os.getcwd()) / "data"
 THREADS_FILE = DATA_DIR / "threads.json"
+DRAFTS_FILE = DATA_DIR / "drafts.json"
 pending_users: set[int] = set()
 threads: list[dict] = []
+# Store draft messages with their states
+# Format: {user_id: {"message": "text", "message_id": int, "target_user_id": int, "is_editing": bool}}
+draft_messages: dict[int, dict] = {}
 
 
 def load_threads() -> None:
@@ -56,6 +60,35 @@ def load_threads() -> None:
             threads = []
     except Exception:
         threads = []
+
+
+def load_drafts() -> None:
+    global draft_messages
+    try:
+        draft_messages = json.loads(DRAFTS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(draft_messages, dict):
+            draft_messages = {}
+    except Exception:
+        draft_messages = {}
+
+
+def save_draft(user_id: int, draft_data: dict) -> None:
+    draft_messages[user_id] = draft_data
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        DRAFTS_FILE.write_text(json.dumps(draft_messages), encoding="utf-8")
+    except Exception as e:
+        print("Failed to save draft:", e)
+
+
+def remove_draft(user_id: int) -> None:
+    if user_id in draft_messages:
+        del draft_messages[user_id]
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            DRAFTS_FILE.write_text(json.dumps(draft_messages), encoding="utf-8")
+        except Exception as e:
+            print("Failed to remove draft:", e)
 
 
 def save_thread(row: dict) -> None:
@@ -75,6 +108,18 @@ def find_user_by_group_message(group_chat_id: str, group_message_id: int) -> int
 
 
 load_threads()
+load_drafts()
+
+
+def create_send_edit_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Create inline keyboard with Send and Edit buttons."""
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Send", callback_data=f"send_{user_id}"),
+            InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{user_id}")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def resolve_user_chat_id(reply_to_message) -> int | None:
@@ -94,6 +139,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not msg or not msg.text:
         return
 
+    # Check if this is an edit message first
+    admin_user_id = msg.from_user.id
+    if (msg.reply_to_message and 
+        admin_user_id in draft_messages and 
+        draft_messages[admin_user_id].get("is_editing", False)):
+        await on_edit_message(update, context)
+        return
+
     # Reply in group: only in configured group, only to bot's messages
     if msg.reply_to_message:
         if str(msg.chat_id) != GROUP_ID:
@@ -102,9 +155,31 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         user_chat_id = await resolve_user_chat_id(msg.reply_to_message)
         if user_chat_id is not None:
-            await context.bot.send_message(chat_id=user_chat_id, text=msg.text)
-            pending_users.discard(user_chat_id)
-            log.info("REPLY_BACK to_user=%s text=%s", user_chat_id, (msg.text[:50] + "…") if len(msg.text) > 50 else msg.text)
+            # Send message with Send/Edit buttons to the admin who replied
+            admin_user_id = msg.from_user.id
+            keyboard = create_send_edit_keyboard(user_chat_id)
+            
+            # Store the draft message
+            draft_data = {
+                "message": msg.text,
+                "target_user_id": user_chat_id,
+                "is_editing": False
+            }
+            save_draft(admin_user_id, draft_data)
+            
+            # Send the message with buttons to the admin
+            sent_msg = await context.bot.send_message(
+                chat_id=admin_user_id, 
+                text=f"📝 **Draft Reply:**\n\n{msg.text}\n\n👆 Choose an action:", 
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            
+            # Update draft with message_id for editing
+            draft_data["message_id"] = sent_msg.message_id
+            save_draft(admin_user_id, draft_data)
+            
+            log.info("DRAFT_CREATED admin=%s target_user=%s text=%s", admin_user_id, user_chat_id, (msg.text[:50] + "…") if len(msg.text) > 50 else msg.text)
         return
 
     # Only forward when user messages in private
@@ -149,6 +224,103 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     pending_users.add(msg.chat_id)
 
 
+async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle callback queries from Send/Edit buttons."""
+    query = update.callback_query
+    await query.answer()
+    
+    if not query.data:
+        return
+    
+    admin_user_id = query.from_user.id
+    
+    # Check if admin has a draft
+    if admin_user_id not in draft_messages:
+        await query.edit_message_text("❌ No draft found. Please reply to a user message first.")
+        return
+    
+    draft_data = draft_messages[admin_user_id]
+    
+    if query.data.startswith("send_"):
+        # Send the message to the user
+        target_user_id = draft_data["target_user_id"]
+        message_text = draft_data["message"]
+        
+        try:
+            await context.bot.send_message(chat_id=target_user_id, text=message_text)
+            pending_users.discard(target_user_id)
+            
+            # Update the admin's message to show it was sent
+            await query.edit_message_text(
+                f"✅ **Message Sent Successfully!**\n\n{message_text}",
+                parse_mode="Markdown"
+            )
+            
+            # Remove the draft
+            remove_draft(admin_user_id)
+            
+            log.info("MESSAGE_SENT admin=%s to_user=%s text=%s", admin_user_id, target_user_id, (message_text[:50] + "…") if len(message_text) > 50 else message_text)
+            
+        except Exception as e:
+            log.exception("Failed to send message to user: %s", e)
+            await query.edit_message_text(
+                f"❌ **Failed to send message.**\n\nError: {str(e)}\n\nPlease try again.",
+                parse_mode="Markdown"
+            )
+    
+    elif query.data.startswith("edit_"):
+        # Enter edit mode
+        draft_data["is_editing"] = True
+        save_draft(admin_user_id, draft_data)
+        
+        await query.edit_message_text(
+            f"✏️ **Edit Mode**\n\nCurrent message:\n{draft_data['message']}\n\n📝 Send your edited message as a reply to this message.",
+            parse_mode="Markdown"
+        )
+
+
+async def on_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle edited messages when user is in edit mode."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    
+    admin_user_id = msg.from_user.id
+    
+    # Check if this is a reply to our edit message and user is in edit mode
+    if (msg.reply_to_message and 
+        admin_user_id in draft_messages and 
+        draft_messages[admin_user_id].get("is_editing", False)):
+        
+        # Update the draft with the new message
+        draft_data = draft_messages[admin_user_id]
+        draft_data["message"] = msg.text
+        draft_data["is_editing"] = False
+        save_draft(admin_user_id, draft_data)
+        
+        # Create new keyboard and update the message
+        keyboard = create_send_edit_keyboard(draft_data["target_user_id"])
+        
+        try:
+            # Edit the original message with the new content
+            await context.bot.edit_message_text(
+                chat_id=admin_user_id,
+                message_id=draft_data["message_id"],
+                text=f"📝 **Updated Draft Reply:**\n\n{msg.text}\n\n👆 Choose an action:",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            
+            # Delete the user's edit message to keep chat clean
+            await msg.delete()
+            
+            log.info("DRAFT_UPDATED admin=%s new_text=%s", admin_user_id, (msg.text[:50] + "…") if len(msg.text) > 50 else msg.text)
+            
+        except Exception as e:
+            log.exception("Failed to update draft: %s", e)
+            await msg.reply_text("❌ Failed to update draft. Please try again.")
+
+
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(WELCOME_MESSAGE)
 
@@ -161,6 +333,7 @@ def main() -> None:
         .build()
     )
     app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CallbackQueryHandler(on_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     if USE_WEBHOOK:
