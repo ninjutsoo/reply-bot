@@ -1,0 +1,33 @@
+# Render.com Blueprint — deploy as a Web Service with this file in the repo root.
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: reply-bot
+    runtime: python
+    region: oregon
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROUP_ID
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: WELCOME_MESSAGE
+        optional: true
+      - key: MESSAGE_AFTER
+        optional: true
+      - key: WAITING_MESSAGE
+        optional: true
