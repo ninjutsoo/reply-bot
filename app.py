@@ -1,9 +1,17 @@
 import json
+import logging
 import os
 import re
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
 
@@ -96,6 +104,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if user_chat_id is not None:
             await context.bot.send_message(chat_id=user_chat_id, text=msg.text)
             pending_users.discard(user_chat_id)
+            log.info("REPLY_BACK to_user=%s text=%s", user_chat_id, (msg.text[:50] + "…") if len(msg.text) > 50 else msg.text)
         return
 
     # Only forward when user messages in private
@@ -116,15 +125,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         sent = await context.bot.send_message(chat_id=GROUP_ID, text=user_line)
         group_message_id = sent.message_id
+        log.info("MESSAGE_SENT user_id=%s name=%s forwarded_to_group group_message_id=%s", msg.chat_id, full_name, group_message_id)
     except Exception as e:
-        print("Failed to send message to group:", e)
+        log.exception("Failed to send message to group: %s", e)
         await context.bot.send_message(
             msg.chat_id, "Couldn't reach the admins right now. Please try again in a moment."
         )
         return
 
     if group_message_id is None:
-        print("Send to group returned no message id")
+        log.error("Send to group returned no message id")
         await context.bot.send_message(
             msg.chat_id, "Couldn't reach the admins right now. Please try again in a moment."
         )
