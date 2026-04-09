@@ -164,7 +164,31 @@ Do **not** set `WEBHOOK_BASE_URL` or `PORT` in `.env` for local run; the app wil
 
 ---
 
-## 7. Troubleshooting
+## 7. Run another bot from the same repo
+
+If you want a **second bot for a different Telegram group** and the behavior is otherwise the same, you do **not** need another fork or another codebase.
+
+Create a **second Telegram bot** in BotFather, create or choose the **second group**, and deploy a **second service from this same repo** with a different set of environment variables:
+
+| Key | First bot | Second bot |
+|-----|-----------|------------|
+| `BOT_TOKEN` | first bot token | second bot token |
+| `GROUP_ID` | first group id | second group id |
+| `WEBHOOK_BASE_URL` | first Render URL | second Render URL |
+| `WEBHOOK_SECRET` | optional unique secret | optional unique secret |
+| `DATA_DIR` | `data` or blank | `data-bot-2` if sharing one machine |
+
+Notes:
+
+- On **Render**, each service gets its own URL, so the webhook is naturally separate. Use the second service URL as the second bot's `WEBHOOK_BASE_URL`.
+- If both bots run on the **same local machine/server**, set a different `DATA_DIR` for each bot so drafts and thread mappings do not mix.
+- If each bot is deployed as a separate Render service, `DATA_DIR` is optional because each service has its own filesystem.
+
+In short: **same repo, same code, second deployment, different env vars**.
+
+---
+
+## 8. Troubleshooting
 
 - **Bot doesn’t reply in group:** Ensure the bot is in the group and can see messages (e.g. admin, or “Privacy mode” disabled in BotFather).
 - **Webhook not receiving updates:** Check `WEBHOOK_BASE_URL` is exactly the Render URL (https, no trailing slash). Redeploy after changing it.

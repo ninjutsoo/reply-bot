@@ -23,6 +23,7 @@ GROUP_ID = (os.environ.get("GROUP_ID") or "").strip()
 PORT = os.environ.get("PORT")
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET") or "reply-bot-webhook"
+DATA_DIR_ENV = os.environ.get("DATA_DIR")
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is required")
@@ -41,8 +42,14 @@ WAITING_MESSAGE = os.environ.get(
     "Waiting for admins to reply. You can only send another message after they've replied to your previous message.",
 )
 
-# Local file store for message threads
-DATA_DIR = Path(os.getcwd()) / "data"
+# Local file store for message threads and drafts. Allow overriding so multiple
+# bot instances can run from the same codebase without sharing state.
+if DATA_DIR_ENV:
+    data_dir_path = Path(DATA_DIR_ENV)
+    DATA_DIR = data_dir_path if data_dir_path.is_absolute() else Path(os.getcwd()) / data_dir_path
+else:
+    DATA_DIR = Path(os.getcwd()) / "data"
+
 THREADS_FILE = DATA_DIR / "threads.json"
 DRAFTS_FILE = DATA_DIR / "drafts.json"
 pending_users: set[int] = set()
