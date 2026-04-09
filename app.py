@@ -34,7 +34,7 @@ USE_WEBHOOK = bool(PORT and WEBHOOK_BASE_URL)
 
 WELCOME_MESSAGE = os.environ.get(
     "WELCOME_MESSAGE",
-    "Send your message in one message. Our admins will receive it and reply to you here.",
+    "Send your full message in one message. Our admins will receive it and reply to you here. Once you send it, you must wait for an admin to reply before sending another message, so include everything at once. You can also edit your message before sending it.",
 )
 MESSAGE_AFTER = os.environ.get("MESSAGE_AFTER", "We'll get back to you as soon as we can.")
 WAITING_MESSAGE = os.environ.get(

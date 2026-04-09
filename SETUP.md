@@ -73,6 +73,14 @@ Optional (customize messages):
 - `WELCOME_MESSAGE` – message when user sends `/start`
 - `MESSAGE_AFTER` – message sent to user after they send a message (e.g. “We’ll get back to you…”)
 
+Minimum env vars for Render are:
+
+- `BOT_TOKEN`
+- `GROUP_ID`
+- `WEBHOOK_BASE_URL`
+
+`WEBHOOK_SECRET` is optional. If you do not set it, the app uses the default path `reply-bot-webhook`.
+
 After the **first deploy**, copy your service URL (e.g. `https://reply-bot-xxxx.onrender.com`), set `WEBHOOK_BASE_URL` to that URL (no trailing slash), then **Redeploy** so the bot registers the webhook.
 
 ### 2.4 (Optional) Use Blueprint instead of manual setup
@@ -98,6 +106,7 @@ So **webhook is automatically used on Render** once you set:
 
 - `PORT` (Render sets this)
 - `WEBHOOK_BASE_URL` = your Render service URL (e.g. `https://reply-bot-xxxx.onrender.com`)
+- `WEBHOOK_SECRET` is optional; default is `reply-bot-webhook`
 
 No extra step besides setting env vars and redeploying after you have the URL.
 
